@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
-    { name = "Your Name" }
+    { name = "mahparsa" }
 ]
 dependencies = [
     "pandas>=1.5",
@@ -20,17 +20,14 @@ dependencies = [
     "scikit-learn>=1.2",
     "imbalanced-learn>=0.11",
     "shap>=0.44",
+    "xgboost>=1.7",
+    "catboost>=1.2",
+    "sdv>=1.9",
 ]
 
-[project.optional-dependencies]
-boosting = ["xgboost>=1.7", "catboost>=1.2"]
-synthetic = ["sdv>=1.9"]
-all = ["xgboost>=1.7", "catboost>=1.2", "sdv>=1.9"]
-dev = ["pytest>=7.0"]
-
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/fair-ml-pipeline"
-Issues = "https://github.com/YOUR_USERNAME/fair-ml-pipeline/issues"
+Homepage = "https://github.com/mahparsa/fair-ml-pipeline"
+Issues = "https://github.com/mahparsa/fair-ml-pipeline/issues"
 
 [tool.setuptools.packages.find]
 include = ["fair_ml_pipeline*"]
