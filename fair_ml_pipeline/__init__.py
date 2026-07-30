@@ -36,7 +36,8 @@ Typical usage
     interactive_results_explorer(outer_results, best_models_per_fold)
 """
 
-from .data import load_and_merge_data, sanity_check, handle_nan
+from .data import load_and_merge_data, sanity_check
+from .cleaning import describe_data, plot_numeric_distributions, plot_categorical_distributions, handle_nan, explore_and_clean
 from .config import (
     ask_text, ask_choice,
     configure_label_interactively,
