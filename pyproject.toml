@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fair-ml-pipeline"
+version = "0.1.0"
+description = "A fair, explainable nested-cross-validation pipeline for tabular ML, with interactive configuration for any features, any label type, and any sensitive attributes."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name" }
+]
+dependencies = [
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "matplotlib>=3.5",
+    "seaborn>=0.12",
+    "scikit-learn>=1.2",
+    "imbalanced-learn>=0.11",
+    "shap>=0.44",
+]
+
+[project.optional-dependencies]
+boosting = ["xgboost>=1.7", "catboost>=1.2"]
+synthetic = ["sdv>=1.9"]
+all = ["xgboost>=1.7", "catboost>=1.2", "sdv>=1.9"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/fair-ml-pipeline"
+Issues = "https://github.com/YOUR_USERNAME/fair-ml-pipeline/issues"
+
+[tool.setuptools.packages.find]
+include = ["fair_ml_pipeline*"]
