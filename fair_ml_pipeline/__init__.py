@@ -100,7 +100,8 @@ from .results import (
 __version__ = "0.1.0"
 
 __all__ = [
-    "load_and_merge_data", "sanity_check", "handle_nan",
+    "load_and_merge_data", "sanity_check",
+    "describe_data", "plot_numeric_distributions", "plot_categorical_distributions", "handle_nan", "explore_and_clean",
     "ask_text", "ask_choice",
     "configure_label_interactively", "configure_sensitive_features_interactively",
     "configure_feature_columns_interactively", "configure_pipeline_interactively",
