@@ -7,6 +7,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from collections import Counter
+
+from sklearn.base import clone
 from sklearn.model_selection import StratifiedKFold, GridSearchCV
 from sklearn.preprocessing import LabelEncoder, StandardScaler, RobustScaler
 from sklearn.neighbors import NearestNeighbors
@@ -440,27 +443,34 @@ def encode_categorical_fold(X_train, X_test, categorical_cols):
     return X_train, X_test
 
 
-def evaluate_classifiers_inner_cv(X_train, y_train, X_test, y_test, classifiers, param_grids, inner_cv):
+def evaluate_classifiers_inner_cv(X_train, y_train, X_test, y_test, classifiers, param_grids, inner_cv,
+                                  scoring="accuracy"):
     """Runs grid-search hyperparameter tuning for each candidate classifier
-    on the inner CV, scores each tuned model on the outer test fold, and
-    returns the best-scoring model."""
+    on the inner CV and returns the best one.
+
+    The winner is chosen by its *inner* CV score (grid_search.best_score_),
+    not by its score on the outer test fold. Choosing on the outer test fold
+    would leak test information into model selection and make the nested-CV
+    estimate optimistic. The outer-test accuracy is still recorded in
+    `inner_models` for reference.
+    """
     best_classifier = None
     best_params = None
-    best_score = 0.0
+    best_score = -np.inf
     best_model_name = None
     inner_models = {}
 
     for clf, params in zip(classifiers, param_grids):
         model_name = clf.__class__.__name__
         print(f"Evaluating {model_name}...")
-        grid_search = GridSearchCV(estimator=clf, param_grid=params, cv=inner_cv, scoring="accuracy", refit=True)
+        grid_search = GridSearchCV(estimator=clf, param_grid=params, cv=inner_cv, scoring=scoring, refit=True)
         grid_search.fit(X_train, y_train)
         best_model_inner = grid_search.best_estimator_
-        y_pred_inner = best_model_inner.predict(X_test)
-        acc = accuracy_score(y_test, y_pred_inner)
-        inner_models[model_name] = {"model": best_model_inner, "params": grid_search.best_params_, "accuracy": acc}
-        if acc > best_score:
-            best_score = acc
+        acc = accuracy_score(y_test, best_model_inner.predict(X_test))
+        inner_models[model_name] = {"model": best_model_inner, "params": grid_search.best_params_,
+                                    "inner_cv_score": grid_search.best_score_, "accuracy": acc}
+        if grid_search.best_score_ > best_score:
+            best_score = grid_search.best_score_
             best_classifier = best_model_inner
             best_model_name = model_name
             best_params = grid_search.best_params_
@@ -473,7 +483,7 @@ def evaluate_classifiers_inner_cv(X_train, y_train, X_test, y_test, classifiers,
     return best_classifier, best_model_name, best_params, inner_models
 
 
-def plot_mean_roc(fold_roc_data):
+def plot_mean_roc(fold_roc_data, title="ROC Curves Across All Nested CV Folds"):
     """Plots per-fold ROC curves plus the mean ROC curve across all outer folds."""
     mean_fpr = np.linspace(0, 1, 100)
     interpolated_tprs = []
@@ -493,15 +503,38 @@ def plot_mean_roc(fold_roc_data):
     plt.plot([0, 1], [0, 1], "--", color="gray")
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title("ROC Curves Across All Nested CV Folds")
+    plt.title(title)
     plt.legend(fontsize=8, loc="lower right")
     plt.show()
 
 
-def print_final_summary(outer_results, run_fairness):
+def plot_model_comparison_roc(roc_data_by_model):
+    """Overlays the mean ROC curve of every model on one plot."""
+    mean_fpr = np.linspace(0, 1, 100)
+    plt.figure(figsize=(7, 6))
+    for model_name, fold_roc_data in roc_data_by_model.items():
+        tprs = []
+        for fpr, tpr, _, _ in fold_roc_data:
+            interp_tpr = np.interp(mean_fpr, fpr, tpr)
+            interp_tpr[0] = 0.0
+            tprs.append(interp_tpr)
+        mean_tpr = np.mean(tprs, axis=0)
+        mean_tpr[-1] = 1.0
+        aucs = [a for _, _, a, _ in fold_roc_data]
+        plt.plot(mean_fpr, mean_tpr, lw=2,
+                 label=f"{model_name} (AUC={np.mean(aucs):.3f} \u00b1 {np.std(aucs):.3f})")
+    plt.plot([0, 1], [0, 1], "--", color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("Mean ROC per Model (Nested CV)")
+    plt.legend(fontsize=8, loc="lower right")
+    plt.show()
+
+
+def print_final_summary(outer_results, run_fairness, title="Final Summary"):
     """Prints the per-fold results table and the overall mean \u00b1 SD
     summary line for each performance metric."""
-    print("\n======= Final Summary =======")
+    print(f"\n======= {title} =======")
     for res in outer_results:
         fold = res["fold"]
         print(f"Fold {fold} - {res['model_name']}: Acc={res['accuracy']:.4f}, F1={res['f1_score']:.4f}, "
@@ -517,50 +550,25 @@ def print_final_summary(outer_results, run_fairness):
 
 
 # =========================
-# Main nested CV driver
+# Shared building blocks for the nested CV drivers
 # =========================
-def nested_cv_normalized_oversampled_featureselected(
-    X, y_array, sensitive_data, classifiers, param_grids,
-    categorical_cols=None, numeric_cols=None,
-    best_cv=None,
-    n_outer_folds=None,
-    run_normalization=None,
-    run_oversampling=None,
-    oversample_sensitive_cols=None,
-    run_synthetic_oversampling=None,
-    synthetic_method=None,
-    synthetic_multiplier=None,
-    synthetic_epochs=None,
-    treat_sensitive_as_features=None,
-    sensitive_feature_cols=None,
-    run_feature_selection=None,
-    fs_method=None, fs_cv_range=None, fs_param_grid="small",
-    run_fairness=True, run_shap=True,
-    teach=False,
-):
-    """
-    Nested cross-validation with, per outer training fold, any combination
-    of the following steps (each independently toggleable): SMOTENC
-    oversampling, categorical encoding, RobustScaler normalization, and
-    feature selection.
+PERFORMANCE_METRICS = ["accuracy", "f1_score", "auc", "balanced_accuracy", "recall"]
 
-    sensitive_data : dict, or a list of (name, array) tuples, e.g.
-        [('gender', gender_array), ('ethnicity', ethnicity_array)]
-    teach : bool, default False. If True, calls explain_step(...) right
-        after the user opts into normalization/oversampling/synthetic
-        data/feature selection/fairness/SHAP, printing a plain-language
-        explanation and the real function source code for that step.
-    """
+
+def _resolve_pipeline_options(
+    X, sensitive_data, categorical_cols, numeric_cols, best_cv, n_outer_folds,
+    run_normalization, run_oversampling, oversample_sensitive_cols,
+    run_synthetic_oversampling, synthetic_method, synthetic_multiplier, synthetic_epochs,
+    treat_sensitive_as_features, sensitive_feature_cols,
+    run_feature_selection, fs_method, fs_cv_range,
+    run_fairness, run_shap, n_top_features, teach,
+):
+    """Fills in every option that was left as None by asking the user,
+    prints the configuration, and returns everything as one dict."""
     from .prompts import (
         ask_int_in_range, ask_yes_no, ask_synthetic_method,
         ask_feature_selection_methods, ask_n_top_features,
     )
-    from .fairness import compute_all_sensitive_fairness
-
-    categorical_cols = categorical_cols or []
-    numeric_cols = numeric_cols or []
-    sensitive_data = dict(sensitive_data)  # accepts a list of (name, array) tuples OR a dict
-    sensitive_data = {col: np.asarray(vals) for col, vals in sensitive_data.items()}
 
     def _teach(key):
         if teach:
@@ -634,125 +642,154 @@ def nested_cv_normalized_oversampled_featureselected(
         _teach("fairness")
     if run_shap:
         _teach("shap")
+    if run_shap and n_top_features is None:
+        n_top_features = ask_n_top_features(X.shape[1])
 
-    n_top_features = ask_n_top_features(X.shape[1]) if run_shap else None
+    return {
+        "best_cv": best_cv, "n_outer_folds": n_outer_folds,
+        "run_normalization": run_normalization, "run_oversampling": run_oversampling,
+        "oversample_sensitive_cols": oversample_sensitive_cols,
+        "run_synthetic_oversampling": run_synthetic_oversampling, "synthetic_method": synthetic_method,
+        "synthetic_multiplier": synthetic_multiplier, "synthetic_epochs": synthetic_epochs,
+        "treat_sensitive_as_features": treat_sensitive_as_features,
+        "sensitive_feature_cols": sensitive_feature_cols or [],
+        "run_feature_selection": run_feature_selection, "fs_method": fs_method, "fs_cv_range": fs_cv_range,
+        "n_top_features": n_top_features,
+    }
 
-    outer_cv = StratifiedKFold(n_splits=n_outer_folds, shuffle=True, random_state=42)
-    outer_results = []
-    best_models_per_fold = {}
-    inner_best_models = {}
-    fold_roc_data = []
-    selected_features_per_fold = []
-    fs_method_per_fold = []
 
-    for fold_idx, (train_index, test_index) in enumerate(outer_cv.split(X, y_array), 1):
-        print(f"\n========= Fold {fold_idx} =========")
-        X_train, X_test = X.iloc[train_index].reset_index(drop=True), X.iloc[test_index].reset_index(drop=True)
-        y_train, y_test = y_array[train_index], y_array[test_index]
-        sensitive_test = {col: vals[test_index] for col, vals in sensitive_data.items()}
-        sensitive_train = {col: vals[train_index] for col, vals in sensitive_data.items()}
+def _prepare_fold(X_train, X_test, y_train, sensitive_train, sensitive_test, opts,
+                  categorical_cols, numeric_cols, fs_param_grid="small", feature_subset=None):
+    """Applies every enabled preprocessing step to one train/test split,
+    fitting everything on the training side only.
 
-        fold_categorical_cols = list(categorical_cols)
-        if treat_sensitive_as_features:
-            for col in sensitive_feature_cols:
-                if col in sensitive_train:
-                    X_train[col] = sensitive_train[col]
+    X_test may be None (used when refitting a final model on all the data).
+    If `feature_subset` is given, feature selection is skipped and those
+    columns are used directly.
+    """
+    X_train = X_train.reset_index(drop=True).copy()
+    X_test = X_test.reset_index(drop=True).copy() if X_test is not None else None
+
+    fold_categorical_cols = list(categorical_cols)
+    if opts["treat_sensitive_as_features"]:
+        for col in opts["sensitive_feature_cols"]:
+            if col in sensitive_train:
+                X_train[col] = sensitive_train[col]
+                if X_test is not None:
                     X_test[col] = sensitive_test[col]
-                    if col not in fold_categorical_cols:
-                        fold_categorical_cols.append(col)
+                if col not in fold_categorical_cols:
+                    fold_categorical_cols.append(col)
 
-        n_start = len(X_train)
+    n_start = len(X_train)
+    fold_sensitive_train = {col: sensitive_train[col] for col in opts["oversample_sensitive_cols"] if col in sensitive_train}
 
-        if run_synthetic_oversampling:
-            fold_sensitive_train = {col: sensitive_train[col] for col in oversample_sensitive_cols if col in sensitive_train}
-            X_train, y_train, fold_sensitive_train = synthetic_oversample_fold(
-                X_train, y_train, fold_categorical_cols,
-                method=synthetic_method, multiplier=synthetic_multiplier, epochs=synthetic_epochs,
-                sensitive_train=fold_sensitive_train,
-            )
-        else:
-            fold_sensitive_train = {col: sensitive_train[col] for col in oversample_sensitive_cols if col in sensitive_train}
-        n_after_synthetic = len(X_train)
-
-        if run_oversampling:
-            X_train, y_train = oversample_fold(X_train, y_train, fold_categorical_cols, sensitive_train=fold_sensitive_train)
-        n_after_oversample = len(X_train)
-
-        n_synthetic_rows = n_after_synthetic - n_start
-        n_oversampled_rows = n_after_oversample - n_after_synthetic
-
-        if fold_categorical_cols:
-            X_train, X_test = encode_categorical_fold(X_train, X_test, fold_categorical_cols)
-
-        if run_normalization and numeric_cols:
-            X_train, X_test = normalize_fold(X_train, X_test, numeric_cols)
-
-        if run_feature_selection:
-            _, _, fs_summary = pick_features(X_train, y_train, method=fs_method, cv_range=fs_cv_range,
-                                              param_grid=fs_param_grid, plot=False, verbose=False)
-            fold_selected_features = fs_summary["feature_names"]
-            fold_fs_method = fs_summary["method"]
-            X_train = X_train[fold_selected_features]
-            X_test = X_test[fold_selected_features]
-        else:
-            fold_selected_features = list(X_train.columns)
-            fold_fs_method = None
-
-        selected_features_per_fold.append(fold_selected_features)
-        fs_method_per_fold.append(fold_fs_method)
-        print(f"Fold {fold_idx} selected features ({len(fold_selected_features)}): {fold_selected_features}")
-        if fold_fs_method is not None:
-            print(f"Fold {fold_idx} winning feature selection method: {fold_fs_method}")
-
-        inner_cv = StratifiedKFold(n_splits=best_cv, shuffle=True, random_state=42)
-        best_classifier, best_model_name, best_params, inner_models = evaluate_classifiers_inner_cv(
-            X_train, y_train, X_test, y_test, classifiers, param_grids, inner_cv
+    if opts["run_synthetic_oversampling"]:
+        X_train, y_train, fold_sensitive_train = synthetic_oversample_fold(
+            X_train, y_train, fold_categorical_cols,
+            method=opts["synthetic_method"], multiplier=opts["synthetic_multiplier"],
+            epochs=opts["synthetic_epochs"], sensitive_train=fold_sensitive_train,
         )
-        for model_name, info in inner_models.items():
-            inner_best_models[(fold_idx, model_name)] = info
+    n_after_synthetic = len(X_train)
 
-        print(f"Best Hyperparameters from Inner CV for Fold {fold_idx}: {best_model_name} with {best_params}")
+    if opts["run_oversampling"]:
+        X_train, y_train = oversample_fold(X_train, y_train, fold_categorical_cols, sensitive_train=fold_sensitive_train)
+    n_after_oversample = len(X_train)
 
-        y_pred_outer = best_classifier.predict(X_test)
-        if hasattr(best_classifier, "predict_proba"):
-            y_score_outer = best_classifier.predict_proba(X_test)[:, 1]
+    if fold_categorical_cols:
+        X_test_for_encoding = X_test if X_test is not None else X_train.iloc[:0]
+        X_train, X_test_encoded = encode_categorical_fold(X_train, X_test_for_encoding, fold_categorical_cols)
+        if X_test is not None:
+            X_test = X_test_encoded
+
+    if opts["run_normalization"] and numeric_cols:
+        if X_test is not None:
+            X_train, X_test = normalize_fold(X_train, X_test, numeric_cols)
         else:
-            y_score_outer = y_pred_outer.astype(float)
+            X_train = X_train.copy()
+            X_train[numeric_cols] = RobustScaler().fit_transform(X_train[numeric_cols])
 
-        acc = accuracy_score(y_test, y_pred_outer)
-        f1 = f1_score(y_test, y_pred_outer)
-        bal_acc = balanced_accuracy_score(y_test, y_pred_outer)
-        rec = recall_score(y_test, y_pred_outer)
-        auc_score = roc_auc_score(y_test, y_score_outer)
-        cm = confusion_matrix(y_test, y_pred_outer)
+    fs_method_used = None
+    if feature_subset is not None:
+        selected = [c for c in feature_subset if c in X_train.columns]
+    elif opts["run_feature_selection"]:
+        _, _, fs_summary = pick_features(X_train, y_train, method=opts["fs_method"], cv_range=opts["fs_cv_range"],
+                                         param_grid=fs_param_grid, plot=False, verbose=False)
+        selected = fs_summary["feature_names"]
+        fs_method_used = fs_summary["method"]
+    else:
+        selected = list(X_train.columns)
 
-        fpr, tpr, _ = roc_curve(y_test, y_score_outer)
-        fold_roc_data.append((fpr, tpr, auc_score, fold_idx))
+    X_train = X_train[selected]
+    if X_test is not None:
+        X_test = X_test[selected]
 
-        if run_fairness:
-            fairness_metrics = compute_all_sensitive_fairness(y_test, y_pred_outer, sensitive_test)
-        else:
-            fairness_metrics = None
-        print(f"Accuracy: {acc:.4f}, F1: {f1:.4f}, AUC: {auc_score:.4f}, Balanced Acc: {bal_acc:.4f}, Recall: {rec:.4f}")
-        if run_fairness:
-            print(f"Fairness Metrics for Fold {fold_idx}: {fairness_metrics}")
+    return {
+        "X_train": X_train, "X_test": X_test, "y_train": y_train,
+        "selected_features": list(selected), "fs_method": fs_method_used,
+        "n_synthetic_rows": n_after_synthetic - n_start,
+        "n_oversampled_rows": n_after_oversample - n_after_synthetic,
+    }
 
-        outer_results.append({"fold": fold_idx, "model_name": best_model_name, "accuracy": acc, "f1_score": f1,
-            "auc": auc_score, "balanced_accuracy": bal_acc, "recall": rec, "confusion_matrix": cm, "fairness": fairness_metrics,
-            "selected_features": fold_selected_features, "fs_method": fold_fs_method,
-            "n_synthetic_rows": n_synthetic_rows, "n_oversampled_rows": n_oversampled_rows})
-        best_models_per_fold[fold_idx] = {"model": best_classifier, "model_name": best_model_name, "params": best_params, "metrics": outer_results[-1]}
 
-        if run_shap:
-            from .explain import run_shap_for_fold as _run_shap_for_fold
-            fold_shap = _run_shap_for_fold(fold_idx, best_classifier, X_train, X_test, sensitive_test, n_top_features)
-            if fold_shap is not None:
-                best_models_per_fold[fold_idx]["shap"] = fold_shap
+def _score_on_test(model, X_test, y_test, sensitive_test, run_fairness):
+    """Scores a fitted model on the outer test fold. Returns (metrics, roc)."""
+    from .fairness import compute_all_sensitive_fairness
 
+    y_pred = model.predict(X_test)
+    y_score = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else y_pred.astype(float)
+    auc_score = roc_auc_score(y_test, y_score)
+    fpr, tpr, _ = roc_curve(y_test, y_score)
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "f1_score": f1_score(y_test, y_pred),
+        "auc": auc_score,
+        "balanced_accuracy": balanced_accuracy_score(y_test, y_pred),
+        "recall": recall_score(y_test, y_pred),
+        "confusion_matrix": confusion_matrix(y_test, y_pred),
+        "fairness": compute_all_sensitive_fairness(y_test, y_pred, sensitive_test) if run_fairness else None,
+    }
+    return metrics, (fpr, tpr, auc_score)
+
+
+def _unique_model_names(classifiers):
+    """Class names, with a numeric suffix if the same class appears twice."""
+    counts = Counter(clf.__class__.__name__ for clf in classifiers)
+    seen = Counter()
+    names = []
+    for clf in classifiers:
+        base = clf.__class__.__name__
+        seen[base] += 1
+        names.append(f"{base}_{seen[base]}" if counts[base] > 1 else base)
+    return names
+
+
+def _consensus_features(selected_features_per_fold, all_columns):
+    """Features to use when refitting a final model on all the data:
+    the features picked in every fold; if none, the ones picked in at
+    least half the folds; if still none, every column."""
+    common = get_common_features(selected_features_per_fold)
+    if common:
+        return common, "selected in every fold"
+    n_folds = len(selected_features_per_fold)
+    counts = Counter(f for feats in selected_features_per_fold for f in feats)
+    majority = sorted(f for f, c in counts.items() if c >= n_folds / 2)
+    if majority:
+        return majority, "selected in at least half of the folds"
+    return list(all_columns), "all columns (no feature was selected consistently)"
+
+
+def _most_frequent_params(params_list):
+    """Returns (params, count) for the hyperparameter set chosen most often across folds."""
+    keyed = [tuple(sorted((k, repr(v)) for k, v in p.items())) for p in params_list]
+    top_key, count = Counter(keyed).most_common(1)[0]
+    return params_list[keyed.index(top_key)], count
+
+
+def _print_fold_config_summary(selected_features_per_fold, fs_method_per_fold, run_feature_selection):
+    n_folds = len(selected_features_per_fold)
     common_features = get_common_features(selected_features_per_fold)
-    print(f"\n======= Common Features Across All {n_outer_folds} Folds =======")
+    print(f"\n======= Common Features Across All {n_folds} Folds =======")
     print(f"{len(common_features)} feature(s) selected in every fold: {common_features}")
-
     if run_feature_selection:
         print(f"\n======= Winning Feature Selection Method Per Fold =======")
         for i, m in enumerate(fs_method_per_fold, 1):
@@ -761,8 +798,392 @@ def nested_cv_normalized_oversampled_featureselected(
         print(f"\nMost frequent winning method overall: {method_counts.index[0]} "
               f"(won {method_counts.iloc[0]} of {len(fs_method_per_fold)} folds)")
         print(f"Full breakdown:\n{method_counts.to_string()}")
+    return common_features
+
+
+# =========================
+# Main nested CV driver (original behaviour: one winner per fold)
+# =========================
+def nested_cv_normalized_oversampled_featureselected(
+    X, y_array, sensitive_data, classifiers, param_grids,
+    categorical_cols=None, numeric_cols=None,
+    best_cv=None,
+    n_outer_folds=None,
+    run_normalization=None,
+    run_oversampling=None,
+    oversample_sensitive_cols=None,
+    run_synthetic_oversampling=None,
+    synthetic_method=None,
+    synthetic_multiplier=None,
+    synthetic_epochs=None,
+    treat_sensitive_as_features=None,
+    sensitive_feature_cols=None,
+    run_feature_selection=None,
+    fs_method=None, fs_cv_range=None, fs_param_grid="small",
+    run_fairness=True, run_shap=True,
+    teach=False,
+    n_top_features=None,
+    inner_scoring="accuracy",
+):
+    """
+    Nested cross-validation with, per outer training fold, any combination
+    of the following steps (each independently toggleable): SMOTENC
+    oversampling, categorical encoding, RobustScaler normalization, and
+    feature selection.
+
+    In every outer fold all classifiers are tuned and the one with the best
+    inner-CV score is kept for that fold, so different folds may end up with
+    different model types. To tune and report *each* model separately and
+    then pick one model type overall, use `nested_cv_per_model` instead.
+
+    sensitive_data : dict, or a list of (name, array) tuples, e.g.
+        [('gender', gender_array), ('ethnicity', ethnicity_array)]
+    teach : bool, default False. If True, calls explain_step(...) right
+        after the user opts into normalization/oversampling/synthetic
+        data/feature selection/fairness/SHAP, printing a plain-language
+        explanation and the real function source code for that step.
+    n_top_features : int or None. Number of SHAP features to rank; asked
+        interactively if None and run_shap is True.
+    inner_scoring : sklearn scoring string used by the inner GridSearchCV.
+    """
+    categorical_cols = categorical_cols or []
+    numeric_cols = numeric_cols or []
+    sensitive_data = {col: np.asarray(vals) for col, vals in dict(sensitive_data).items()}
+
+    opts = _resolve_pipeline_options(
+        X, sensitive_data, categorical_cols, numeric_cols, best_cv, n_outer_folds,
+        run_normalization, run_oversampling, oversample_sensitive_cols,
+        run_synthetic_oversampling, synthetic_method, synthetic_multiplier, synthetic_epochs,
+        treat_sensitive_as_features, sensitive_feature_cols,
+        run_feature_selection, fs_method, fs_cv_range,
+        run_fairness, run_shap, n_top_features, teach,
+    )
+
+    outer_cv = StratifiedKFold(n_splits=opts["n_outer_folds"], shuffle=True, random_state=42)
+    outer_results = []
+    best_models_per_fold = {}
+    fold_roc_data = []
+    selected_features_per_fold = []
+    fs_method_per_fold = []
+
+    for fold_idx, (train_index, test_index) in enumerate(outer_cv.split(X, y_array), 1):
+        print(f"\n========= Fold {fold_idx} =========")
+        y_test = y_array[test_index]
+        sensitive_train = {col: vals[train_index] for col, vals in sensitive_data.items()}
+        sensitive_test = {col: vals[test_index] for col, vals in sensitive_data.items()}
+
+        prep = _prepare_fold(X.iloc[train_index], X.iloc[test_index], y_array[train_index],
+                             sensitive_train, sensitive_test, opts, categorical_cols, numeric_cols,
+                             fs_param_grid=fs_param_grid)
+        X_train, X_test, y_train = prep["X_train"], prep["X_test"], prep["y_train"]
+
+        selected_features_per_fold.append(prep["selected_features"])
+        fs_method_per_fold.append(prep["fs_method"])
+        print(f"Fold {fold_idx} selected features ({len(prep['selected_features'])}): {prep['selected_features']}")
+        if prep["fs_method"] is not None:
+            print(f"Fold {fold_idx} winning feature selection method: {prep['fs_method']}")
+
+        inner_cv = StratifiedKFold(n_splits=opts["best_cv"], shuffle=True, random_state=42)
+        best_classifier, best_model_name, best_params, _ = evaluate_classifiers_inner_cv(
+            X_train, y_train, X_test, y_test, classifiers, param_grids, inner_cv, scoring=inner_scoring,
+        )
+        print(f"Best Hyperparameters from Inner CV for Fold {fold_idx}: {best_model_name} with {best_params}")
+
+        metrics, (fpr, tpr, auc_score) = _score_on_test(best_classifier, X_test, y_test, sensitive_test, run_fairness)
+        fold_roc_data.append((fpr, tpr, auc_score, fold_idx))
+        print(f"Accuracy: {metrics['accuracy']:.4f}, F1: {metrics['f1_score']:.4f}, AUC: {auc_score:.4f}, "
+              f"Balanced Acc: {metrics['balanced_accuracy']:.4f}, Recall: {metrics['recall']:.4f}")
+        if run_fairness:
+            print(f"Fairness Metrics for Fold {fold_idx}: {metrics['fairness']}")
+
+        outer_results.append({"fold": fold_idx, "model_name": best_model_name, **metrics,
+            "selected_features": prep["selected_features"], "fs_method": prep["fs_method"],
+            "n_synthetic_rows": prep["n_synthetic_rows"], "n_oversampled_rows": prep["n_oversampled_rows"]})
+        best_models_per_fold[fold_idx] = {"model": best_classifier, "model_name": best_model_name,
+                                          "params": best_params, "metrics": outer_results[-1]}
+
+        if run_shap:
+            from .explain import run_shap_for_fold as _run_shap_for_fold
+            fold_shap = _run_shap_for_fold(fold_idx, best_classifier, X_train, X_test, sensitive_test, opts["n_top_features"])
+            if fold_shap is not None:
+                best_models_per_fold[fold_idx]["shap"] = fold_shap
+
+    common_features = _print_fold_config_summary(selected_features_per_fold, fs_method_per_fold, opts["run_feature_selection"])
 
     plot_mean_roc(fold_roc_data)
     print_final_summary(outer_results, run_fairness)
 
     return outer_results, best_models_per_fold, common_features
+
+
+# =========================
+# Per-model nested CV driver: tune + report each model, then pick one
+# =========================
+def nested_cv_per_model(
+    X, y_array, sensitive_data, classifiers, param_grids,
+    categorical_cols=None, numeric_cols=None,
+    best_cv=None,
+    n_outer_folds=None,
+    run_normalization=None,
+    run_oversampling=None,
+    oversample_sensitive_cols=None,
+    run_synthetic_oversampling=None,
+    synthetic_method=None,
+    synthetic_multiplier=None,
+    synthetic_epochs=None,
+    treat_sensitive_as_features=None,
+    sensitive_feature_cols=None,
+    run_feature_selection=None,
+    fs_method=None, fs_cv_range=None, fs_param_grid="small",
+    run_fairness=True, run_shap=True,
+    teach=False,
+    n_top_features=None,
+    inner_scoring="accuracy",
+    selection_metric="accuracy",
+    refit_final="all",
+    shap_for="best",
+    plot=True,
+    n_jobs=None,
+):
+    """
+    Nested cross-validation that treats every classifier on its own:
+
+      1. Preprocess each outer fold once (oversampling, encoding,
+         normalization, feature selection -- all fitted on the training
+         side only), so every model sees exactly the same folds.
+      2. For each model in turn (e.g. XGBoost, then RandomForest, ...):
+         tune its hyperparameters on the inner CV of every outer fold,
+         score it on the outer test fold, and print a full report for that
+         model: per-fold best params, metrics, fairness, and its final
+         best parameters.
+      3. Compare the models on their mean outer-fold `selection_metric`
+         and select one model type.
+      4. The selected model comes with its own tuned hyperparameters: it is
+         refitted with GridSearchCV on the whole dataset (see refit_final),
+         so you get one final model + one parameter set to go with.
+
+    Parameters (in addition to those of
+    nested_cv_normalized_oversampled_featureselected)
+    ----------
+    selection_metric : one of "accuracy", "f1_score", "auc",
+        "balanced_accuracy", "recall". Mean outer-fold value used to rank
+        models. Ties are broken by the smaller standard deviation.
+    refit_final : "all" (default), "best", or None. Which models get a
+        final GridSearchCV refit on all the data. "all" gives you a final
+        tuned model for every classifier; "best" only for the winner.
+    shap_for : "best" (default), "all", or None. Which models get SHAP
+        explanations per fold (SHAP can be slow, so the default only
+        explains the selected model). Ignored if run_shap is False.
+    plot : draw per-model ROC curves and a comparison ROC plot.
+    n_jobs : passed to GridSearchCV.
+
+    Returns
+    -------
+    dict with keys
+        "models" : {model_name: {
+                "outer_results", "best_models_per_fold",   # same format as the
+                                                           # original driver, so they
+                                                           # work with save_nested_cv_results
+                                                           # and interactive_results_explorer
+                "summary"          : {metric: (mean, std)},
+                "params_per_fold"  : list of dicts,
+                "most_frequent_params", "most_frequent_params_count",
+                "final_model", "final_params", "final_inner_cv_score"  (None if not refitted),
+            }}
+        "comparison"      : pandas DataFrame, one row per model, sorted best first
+        "best_model_name" : str
+        "best_model"      : final fitted estimator of the selected model
+                            (or its best fold model if refit_final is None)
+        "best_params"     : dict, the selected model's hyperparameters
+        "final_features"  : feature columns used for the final refit
+        "common_features" : features selected in every outer fold
+        "selection_metric": str
+    """
+    if selection_metric not in PERFORMANCE_METRICS:
+        raise ValueError(f"selection_metric must be one of {PERFORMANCE_METRICS}, got {selection_metric!r}")
+    if refit_final not in ("all", "best", None):
+        raise ValueError("refit_final must be 'all', 'best', or None")
+    if shap_for not in ("all", "best", None):
+        raise ValueError("shap_for must be 'all', 'best', or None")
+    if len(classifiers) != len(param_grids):
+        raise ValueError("classifiers and param_grids must have the same length")
+
+    categorical_cols = categorical_cols or []
+    numeric_cols = numeric_cols or []
+    sensitive_data = {col: np.asarray(vals) for col, vals in dict(sensitive_data).items()}
+    run_shap = bool(run_shap and shap_for)
+
+    opts = _resolve_pipeline_options(
+        X, sensitive_data, categorical_cols, numeric_cols, best_cv, n_outer_folds,
+        run_normalization, run_oversampling, oversample_sensitive_cols,
+        run_synthetic_oversampling, synthetic_method, synthetic_multiplier, synthetic_epochs,
+        treat_sensitive_as_features, sensitive_feature_cols,
+        run_feature_selection, fs_method, fs_cv_range,
+        run_fairness, run_shap, n_top_features, teach,
+    )
+    model_names = _unique_model_names(classifiers)
+
+    # ---- Stage 1: preprocess every outer fold once --------------------------
+    print("\n####### Stage 1: preparing outer folds #######")
+    outer_cv = StratifiedKFold(n_splits=opts["n_outer_folds"], shuffle=True, random_state=42)
+    folds = []
+    for fold_idx, (train_index, test_index) in enumerate(outer_cv.split(X, y_array), 1):
+        sensitive_train = {col: vals[train_index] for col, vals in sensitive_data.items()}
+        sensitive_test = {col: vals[test_index] for col, vals in sensitive_data.items()}
+        prep = _prepare_fold(X.iloc[train_index], X.iloc[test_index], y_array[train_index],
+                             sensitive_train, sensitive_test, opts, categorical_cols, numeric_cols,
+                             fs_param_grid=fs_param_grid)
+        prep.update({"fold": fold_idx, "y_test": y_array[test_index], "sensitive_test": sensitive_test})
+        folds.append(prep)
+        print(f"Fold {fold_idx}: {len(prep['X_train'])} train rows, {len(prep['X_test'])} test rows, "
+              f"{len(prep['selected_features'])} features"
+              + (f" (feature selection winner: {prep['fs_method']})" if prep["fs_method"] else ""))
+
+    selected_features_per_fold = [f["selected_features"] for f in folds]
+    common_features = _print_fold_config_summary(
+        selected_features_per_fold, [f["fs_method"] for f in folds], opts["run_feature_selection"])
+
+    # Full-data preparation for the final refit (done once, shared by all models).
+    full_prep = None
+    if refit_final:
+        final_features, why = _consensus_features(selected_features_per_fold, folds[0]["X_train"].columns)
+        print(f"\nFinal refit will use {len(final_features)} feature(s) ({why}): {final_features}")
+        full_prep = _prepare_fold(X, None, y_array, sensitive_data, None, opts, categorical_cols, numeric_cols,
+                                  feature_subset=final_features)
+    else:
+        final_features = None
+
+    # ---- Stage 2: tune and report each model on its own ---------------------
+    models = {}
+    for model_name, clf, grid in zip(model_names, classifiers, param_grids):
+        print(f"\n####### Stage 2: {model_name} #######")
+        outer_results, best_models_per_fold, roc_data = [], {}, []
+
+        for fold in folds:
+            fold_idx = fold["fold"]
+            inner_cv = StratifiedKFold(n_splits=opts["best_cv"], shuffle=True, random_state=42)
+            grid_search = GridSearchCV(clone(clf), grid, cv=inner_cv, scoring=inner_scoring, refit=True, n_jobs=n_jobs)
+            grid_search.fit(fold["X_train"], fold["y_train"])
+            model = grid_search.best_estimator_
+
+            metrics, (fpr, tpr, auc_score) = _score_on_test(
+                model, fold["X_test"], fold["y_test"], fold["sensitive_test"], run_fairness)
+            roc_data.append((fpr, tpr, auc_score, fold_idx))
+            print(f"  Fold {fold_idx}: best params {grid_search.best_params_} "
+                  f"(inner CV {inner_scoring} = {grid_search.best_score_:.4f}) -> "
+                  f"Acc={metrics['accuracy']:.4f}, F1={metrics['f1_score']:.4f}, AUC={auc_score:.4f}, "
+                  f"BalAcc={metrics['balanced_accuracy']:.4f}, Recall={metrics['recall']:.4f}")
+
+            res = {"fold": fold_idx, "model_name": model_name, **metrics,
+                   "best_params": grid_search.best_params_, "inner_cv_score": grid_search.best_score_,
+                   "selected_features": fold["selected_features"], "fs_method": fold["fs_method"],
+                   "n_synthetic_rows": fold["n_synthetic_rows"], "n_oversampled_rows": fold["n_oversampled_rows"]}
+            outer_results.append(res)
+            best_models_per_fold[fold_idx] = {"model": model, "model_name": model_name,
+                                              "params": grid_search.best_params_, "metrics": res}
+
+        params_per_fold = [r["best_params"] for r in outer_results]
+        frequent_params, frequent_count = _most_frequent_params(params_per_fold)
+        summary = {m: (float(np.mean([r[m] for r in outer_results])), float(np.std([r[m] for r in outer_results])))
+                   for m in PERFORMANCE_METRICS}
+
+        print_final_summary(outer_results, run_fairness, title=f"{model_name} -- Nested CV Results")
+        print(f"\nMost frequently chosen params for {model_name}: {frequent_params} "
+              f"({frequent_count}/{len(folds)} folds)")
+
+        entry = {"outer_results": outer_results, "best_models_per_fold": best_models_per_fold,
+                 "summary": summary, "params_per_fold": params_per_fold,
+                 "most_frequent_params": frequent_params, "most_frequent_params_count": frequent_count,
+                 "final_model": None, "final_params": None, "final_inner_cv_score": None,
+                 "_roc_data": roc_data, "_estimator": clf, "_grid": grid}
+        models[model_name] = entry
+
+        if refit_final == "all":
+            _refit_final_model(model_name, entry, full_prep, opts, inner_scoring, n_jobs)
+
+        if plot:
+            plot_mean_roc(roc_data, title=f"{model_name} -- ROC Across Nested CV Folds")
+
+    # ---- Stage 3: compare models and select one -----------------------------
+    rows = []
+    for model_name, entry in models.items():
+        row = {"model": model_name}
+        for m in PERFORMANCE_METRICS:
+            mean, std = entry["summary"][m]
+            row[f"{m}_mean"] = mean
+            row[f"{m}_std"] = std
+        row["most_frequent_params"] = entry["most_frequent_params"]
+        rows.append(row)
+    comparison = (pd.DataFrame(rows)
+                  .sort_values([f"{selection_metric}_mean", f"{selection_metric}_std"], ascending=[False, True])
+                  .set_index("model"))
+
+    best_model_name = comparison.index[0]
+    best_entry = models[best_model_name]
+
+    print("\n####### Stage 3: model comparison #######")
+    print(f"Ranked by mean outer-fold {selection_metric} (mean \u00b1 SD):")
+    for name, row in comparison.iterrows():
+        print(f"  {name:<28} " + "  ".join(
+            f"{m}={row[f'{m}_mean']:.4f}\u00b1{row[f'{m}_std']:.4f}" for m in PERFORMANCE_METRICS))
+
+    if refit_final == "best":
+        _refit_final_model(best_model_name, best_entry, full_prep, opts, inner_scoring, n_jobs)
+
+    if best_entry["final_model"] is not None:
+        best_model, best_params = best_entry["final_model"], best_entry["final_params"]
+    else:
+        best_params = best_entry["most_frequent_params"]
+        best_fold = max(best_entry["outer_results"], key=lambda r: r[selection_metric])["fold"]
+        best_model = best_entry["best_models_per_fold"][best_fold]["model"]
+
+    print(f"\n>>> Selected model: {best_model_name}")
+    print(f">>> Its hyperparameters: {best_params}")
+    print(f">>> Honest performance estimate (nested CV, {selection_metric}): "
+          f"{best_entry['summary'][selection_metric][0]:.4f} \u00b1 {best_entry['summary'][selection_metric][1]:.4f}")
+
+    if plot and len(models) > 1:
+        plot_model_comparison_roc({name: e["_roc_data"] for name, e in models.items()})
+
+    # ---- Stage 4: SHAP ------------------------------------------------------
+    if run_shap:
+        from .explain import run_shap_for_fold as _run_shap_for_fold
+        shap_models = list(models) if shap_for == "all" else [best_model_name]
+        for model_name in shap_models:
+            print(f"\n####### Stage 4: SHAP for {model_name} #######")
+            for fold in folds:
+                info = models[model_name]["best_models_per_fold"][fold["fold"]]
+                fold_shap = _run_shap_for_fold(fold["fold"], info["model"], fold["X_train"], fold["X_test"],
+                                               fold["sensitive_test"], opts["n_top_features"])
+                if fold_shap is not None:
+                    info["shap"] = fold_shap
+
+    for entry in models.values():
+        for key in ("_roc_data", "_estimator", "_grid"):
+            entry.pop(key, None)
+
+    return {
+        "models": models,
+        "comparison": comparison,
+        "best_model_name": best_model_name,
+        "best_model": best_model,
+        "best_params": best_params,
+        "final_features": final_features,
+        "common_features": common_features,
+        "selection_metric": selection_metric,
+    }
+
+
+def _refit_final_model(model_name, entry, full_prep, opts, inner_scoring, n_jobs):
+    """Tunes one model with GridSearchCV on the whole (preprocessed) dataset
+    and stores the final fitted model + params in `entry`."""
+    cv = StratifiedKFold(n_splits=opts["best_cv"], shuffle=True, random_state=42)
+    grid_search = GridSearchCV(clone(entry["_estimator"]), entry["_grid"], cv=cv,
+                               scoring=inner_scoring, refit=True, n_jobs=n_jobs)
+    grid_search.fit(full_prep["X_train"], full_prep["y_train"])
+    entry["final_model"] = grid_search.best_estimator_
+    entry["final_params"] = grid_search.best_params_
+    entry["final_inner_cv_score"] = grid_search.best_score_
+    print(f"\nFinal {model_name} tuned on all data: {grid_search.best_params_} "
+          f"(CV {inner_scoring} = {grid_search.best_score_:.4f}; use the nested-CV numbers "
+          f"above as the performance estimate, this one is optimistic)")

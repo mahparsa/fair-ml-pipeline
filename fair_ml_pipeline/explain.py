@@ -33,8 +33,18 @@ def run_shap_for_fold(fold_idx, best_classifier, X_train, X_test, sensitive_test
     raw SHAP arrays, or None if SHAP failed for this fold."""
     import shap
     try:
-        explainer = shap.Explainer(best_classifier, X_train)
-        shap_values = explainer(X_test)
+        try:
+            explainer = shap.Explainer(best_classifier, X_train)
+            shap_values = explainer(X_test)
+        except Exception as first_error:
+            # Recent XGBoost versions are rejected by SHAP's default
+            # (interventional) explainer; the tree-path-dependent
+            # TreeExplainer still works for them and other tree models.
+            try:
+                explainer = shap.TreeExplainer(best_classifier, feature_perturbation="tree_path_dependent")
+                shap_values = explainer(X_test)
+            except Exception:
+                raise first_error
         if shap_values.values.ndim == 3:
             shap_values = shap_values[:, :, -1]
         shap_array = shap_values.values

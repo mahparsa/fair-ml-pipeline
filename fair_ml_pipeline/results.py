@@ -601,3 +601,51 @@ def interactive_results_explorer(outer_results, best_models_per_fold):
         again = ask_yes_no("\nAsk another question?")
         if not again:
             break
+
+
+# =========================
+# Per-model results (output of nested_cv_per_model)
+# =========================
+def save_per_model_results(per_model_results, filepath="nested_cv_per_model_results.pkl"):
+    """Saves the dict returned by nested_cv_per_model (every model's fold
+    results, final tuned models, the comparison table, and the selection)."""
+    with open(filepath, "wb") as f:
+        pickle.dump(per_model_results, f)
+    print(f"Per-model results saved to {filepath}")
+
+
+def load_per_model_results(filepath="nested_cv_per_model_results.pkl"):
+    with open(filepath, "rb") as f:
+        data = pickle.load(f)
+    print(f"Per-model results loaded from {filepath}")
+    return data
+
+
+def interactive_per_model_explorer(per_model_results):
+    """Shows the model comparison, lets you pick a model (the selected one
+    is the default), then opens the usual results explorer for that model."""
+    comparison = per_model_results["comparison"]
+    names = list(comparison.index)
+    metric = per_model_results["selection_metric"]
+    while True:
+        print(f"\nModels ranked by mean {metric} (selected: {per_model_results['best_model_name']}):")
+        for i, name in enumerate(names, 1):
+            entry = per_model_results["models"][name]
+            mean, std = entry["summary"][metric]
+            params = entry["final_params"] if entry["final_params"] is not None else entry["most_frequent_params"]
+            print(f"  {i}: {name} -- {metric} {mean:.4f} \u00b1 {std:.4f} -- params {params}")
+        print("  exit: stop")
+        choice = input("Which model do you want to explore? (Enter = selected model): ").strip().lower()
+        if choice == "exit":
+            break
+        if choice == "":
+            name = per_model_results["best_model_name"]
+        else:
+            try:
+                name = names[int(choice) - 1]
+            except (ValueError, IndexError):
+                print("Please enter a valid number.")
+                continue
+        entry = per_model_results["models"][name]
+        print(f"\n--- Exploring {name} ---")
+        interactive_results_explorer(entry["outer_results"], entry["best_models_per_fold"])

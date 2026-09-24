@@ -89,3 +89,90 @@ def ask_n_top_features(n_features):
         except ValueError:
             print(f"Please enter a whole number between 1 and {n_features}.")
     return n_top_features
+
+
+def _print_numbered_columns(columns, hints=None):
+    hints = hints or {}
+    for i, col in enumerate(columns, 1):
+        hint = f"   <- {hints[col]}" if col in hints else ""
+        print(f"  {i}: {col}{hint}")
+
+
+def _parse_column_selection(raw, columns):
+    """Parses '1,3,5-7' and/or column names into a list of column names.
+    Returns (selected, errors)."""
+    selected, errors = [], []
+    for piece in raw.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if piece in columns:
+            candidates = [piece]
+        elif "-" in piece and all(p.strip().isdigit() for p in piece.split("-", 1)):
+            start, end = (int(p) for p in piece.split("-", 1))
+            if not (1 <= start <= end <= len(columns)):
+                errors.append(piece)
+                continue
+            candidates = columns[start - 1:end]
+        elif piece.isdigit() and 1 <= int(piece) <= len(columns):
+            candidates = [columns[int(piece) - 1]]
+        else:
+            errors.append(piece)
+            continue
+        for c in candidates:
+            if c not in selected:
+                selected.append(c)
+    return selected, errors
+
+
+def ask_one_column(question, columns, allow_none=False, none_label="none", hints=None):
+    """Asks the user to pick exactly one column from a numbered list, by
+    number or by name. If allow_none, entering 0 (or leaving it blank)
+    returns None."""
+    columns = list(columns)
+    print(question)
+    if allow_none:
+        print(f"  0: {none_label}")
+    _print_numbered_columns(columns, hints)
+    while True:
+        raw = input("Choice (number or column name): ").strip()
+        if allow_none and raw in ("", "0"):
+            return None
+        selected, errors = _parse_column_selection(raw, columns)
+        if len(selected) == 1 and not errors:
+            return selected[0]
+        print("Please pick exactly one column from the list" + (" (or 0 for none)." if allow_none else "."))
+
+
+def ask_columns(question, columns, allow_empty=True, allow_all=True, hints=None):
+    """Asks the user to pick any number of columns from a numbered list.
+
+    Accepts numbers ('1,4'), ranges ('2-6'), column names, a mix of these,
+    'all' (if allow_all), or a blank line for none (if allow_empty).
+    """
+    columns = list(columns)
+    print(question)
+    _print_numbered_columns(columns, hints)
+    tips = ["numbers like 1,3,5", "ranges like 2-6", "column names"]
+    if allow_all:
+        tips.append("'all'")
+    if allow_empty:
+        tips.append("blank for none")
+    print("Enter " + ", ".join(tips) + ".")
+    while True:
+        raw = input("Columns: ").strip()
+        if not raw:
+            if allow_empty:
+                return []
+            print("Please choose at least one column.")
+            continue
+        if allow_all and raw.lower() == "all":
+            return columns
+        selected, errors = _parse_column_selection(raw, columns)
+        if errors:
+            print(f"Not recognized: {errors}. Please try again.")
+            continue
+        if not selected and not allow_empty:
+            print("Please choose at least one column.")
+            continue
+        return selected
