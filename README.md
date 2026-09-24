@@ -40,8 +40,11 @@ pip install "fair-ml-pipeline[all] @ git+https://github.com/YOUR_USERNAME/fair-m
 
 Say you have your own two CSV files:
 
-- `features.csv` -- one row per subject, with an ID column plus whatever feature columns you want to model
-- `stats.csv` -- one row per subject, with the same ID column plus sensitive attributes (e.g. `age`, `gender`, `ethnicity`, `education`, `financial_status`) and/or your label
+- `features.csv` -- one row per participant, with whatever feature columns you want to model
+- `stats.csv` (optional) -- one row per participant, with demographic attributes and/or your label
+
+Nothing about the column names is assumed. The participant ID column can be called anything
+(and be named differently in the two files), or there may be no ID at all -- you are asked.
 
 ```python
 from fair_ml_pipeline import (
@@ -52,23 +55,24 @@ from fair_ml_pipeline import (
     save_nested_cv_results, interactive_results_explorer,
 )
 
-# 1. Load and merge your own data -- any column names, any ID column
-data = load_and_merge_data(
-    features_path="features.csv",
-    stats_path="stats.csv",
-    id_col="uid",              # column name shared by both files
-)
+# 1. Load and merge your own data. You'll be asked which column is the
+#    participant ID in each file (names may differ), or to match the
+#    files row by row if there is no ID column.
+data = load_and_merge_data(features_path="features.csv", stats_path="stats.csv")
 data = handle_nan(data, strategy="drop")
 
-# 2. Configure interactively -- you'll be asked:
+# 2. Configure interactively, picking columns from numbered lists:
+#    - which column (if any) identifies participants -- it is then kept
+#      out of the label, demographic, and feature choices
 #    - which column is your label, and whether it's categorical or a
 #      score that needs a cutoff
-#    - which columns are your sensitive attributes (as many as you want --
-#      e.g. gender, ethnicity, education, financial_status), each tagged
-#      as categorical or numeric (with bins if numeric)
-#    - which columns are your actual model features
+#    - which demographic attributes to analyse for fairness (any columns,
+#      any number, or none), each categorical or numeric (numeric ones are
+#      split into groups automatically or at boundaries you type)
+#    - which columns are your model features
 config = configure_pipeline_interactively(data)
 X, y, le, sensitive_df, sensitive_cols = build_X_y_from_config(data, config)
+# (add return_ids=True to also get the participant IDs aligned with X)
 
 # 3. Pick your classifier(s) interactively
 classifiers, param_grids = build_classifiers_and_grids()
@@ -96,7 +100,12 @@ interactive_results_explorer(outer_results, best_models_per_fold)
 Every interactive choice can be passed explicitly to skip the prompt -- useful for scripted runs:
 
 ```python
+data = load_and_merge_data("features.csv", "stats.csv",
+                           id_col="participant_code", stats_id_col="subject",  # or id_col=False: match rows
+                           interactive=False)
+
 config = {
+    "id_col": "participant_code",      # or None if there is no ID column
     "label_col": "diagnosis",
     "label_type": "score",
     "cutoff": 10,                      # anything >= 10 is the positive class
@@ -127,6 +136,57 @@ outer_results, best_models_per_fold, common_features = nested_cv_normalized_over
     run_fairness=True, run_shap=True,
 )
 ```
+
+## Tune each model separately, then pick one (`nested_cv_per_model`)
+
+The original driver tunes every classifier inside each outer fold and keeps
+whichever wins that fold, so fold 1 might end up with XGBoost and fold 2 with
+RandomForest. If you'd rather get **one model type with its own best
+hyperparameters**, use `nested_cv_per_model`. It takes the same arguments and:
+
+1. preprocesses each outer fold once, so every model sees identical folds;
+2. for each model in turn (XGBoost, then RandomForest, ...) tunes it on the
+   inner CV, scores it on the outer folds, and prints its full report:
+   per-fold best params, metrics, fairness, ROC;
+3. ranks the models by their mean outer-fold `selection_metric`;
+4. refits each model (or only the winner) with GridSearchCV on all the data,
+   so whichever model is selected comes with its own final tuned parameters.
+
+```python
+from fair_ml_pipeline import (
+    nested_cv_per_model, save_per_model_results, interactive_per_model_explorer,
+    save_nested_cv_results,
+)
+
+results = nested_cv_per_model(
+    X, y, sensitive_data, classifiers, param_grids,
+    numeric_cols=list(X.columns),
+    run_feature_selection=True, run_fairness=True, run_shap=True,
+    selection_metric="balanced_accuracy",  # accuracy | f1_score | auc | balanced_accuracy | recall
+    refit_final="all",                     # "all", "best", or None
+    shap_for="best",                       # SHAP only for the selected model (or "all")
+)
+
+print(results["comparison"])        # one row per model, best first
+print(results["best_model_name"])   # e.g. "XGBClassifier"
+print(results["best_params"])       # that model's own tuned hyperparameters
+final_model = results["best_model"] # fitted on all data, using results["final_features"]
+
+xgb = results["models"]["XGBClassifier"]           # any model's full results
+print(xgb["final_params"], xgb["summary"]["auc"])
+
+save_per_model_results(results)
+interactive_per_model_explorer(results)             # pick a model, then explore it
+
+# or plug one model into the existing tools:
+winner = results["models"][results["best_model_name"]]
+save_nested_cv_results(winner["outer_results"], winner["best_models_per_fold"], results["common_features"])
+```
+
+Note: `final_model` expects the same preprocessing as the final refit
+(the columns in `results["final_features"]`, normalized/encoded the same way).
+The honest performance estimate is the nested-CV mean ± SD, not the CV score
+printed for the final refit.
 
 ## Teaching mode
 
